@@ -115,3 +115,9 @@ Releases への公開は自動ではしない。出したいときに `-Release`
 | `build.ps1` | exe のビルド、起動中の exe の閉じと再起動、Releases 公開 |
 | `smoke.py` | 画面を出さない組み立て検証（開発用） |
 | `clipprobe.py` | クリップボード調査用（開発用） |
+
+---
+
+## ライセンス
+
+[MIT](LICENSE)
