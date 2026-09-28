@@ -10,7 +10,7 @@ import shutil
 import sys
 import uuid
 
-from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, QTimer
+from PySide6.QtCore import QByteArray, QEvent, QPoint, QRect, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QKeySequence, QPainter, QPalette
 from PySide6.QtWidgets import (
     QApplication,
@@ -34,8 +34,10 @@ from PySide6.QtWidgets import (
 
 import actions as fileops
 import appicon
+import control
 import model as core
 import osops
+import session
 import theme
 import view as ui
 import winframe
@@ -436,20 +438,28 @@ class MainWindow(QMainWindow):
         make("プロパティ", self.properties_selected, "Alt+Return")
 
         act_refresh = make("最新の情報に更新", self.reload, ("F5", "Ctrl+R"))
-        act_hidden = make("隠しファイルを表示", self._toggle_hidden, "Ctrl+H", checkable=True)
-        self._menu_actions += [act_refresh, act_hidden]
+        self.act_hidden = make("隠しファイルを表示", self._toggle_hidden, "Ctrl+H", checkable=True)
+        self._menu_actions += [act_refresh, self.act_hidden]
 
         sep = QAction(self)
         sep.setSeparator(True)
         self._menu_actions.append(sep)
 
         group = QActionGroup(self)
+        self._theme_actions = {}
         for name in theme.PALETTES:
             a = QAction(f"テーマ: {name}", self, checkable=True)
             a.setChecked(name == self._theme)
             a.triggered.connect(lambda _, n=name: self._set_theme(n))
             group.addAction(a)
+            self._theme_actions[name] = a
             self._menu_actions.append(a)
+
+        sep = QAction(self)
+        sep.setSeparator(True)
+        self._menu_actions.append(sep)
+        # 窓とタブをそのままにして立ち上げ直す。exe を作り直した後の乗り換え用。
+        self._menu_actions.append(make("再起動（窓とタブはそのまま）", restart_self, "Ctrl+Shift+F5"))
 
     def _build_body(self):
         root = QWidget(objectName="Root")
@@ -791,10 +801,75 @@ class MainWindow(QMainWindow):
         win._update_buttons()
 
     def closeEvent(self, event):
+        # 最後の一枚を閉じるときに状態を覚えておく。次の起動でこの窓とタブが戻る（Chrome と同じ）。
+        if WINDOWS == [self]:
+            save_session()
         if self in WINDOWS:
             WINDOWS.remove(self)
         refresh_chaos()
         super().closeEvent(event)
+
+    # --- 状態の保存と復元 ---------------------------------------------------
+    def session_state(self):
+        """この窓を元通りに作り直すのに要るものを辞書にする。"""
+        limit = session.HISTORY_LIMIT
+        return {
+            "geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
+            "tabs": [{"path": t["path"],
+                      "history": t["history"][-limit:],
+                      "future": t["future"][-limit:]} for t in self._tabs],
+            "current": self.tabbar.currentIndex(),
+            "view_mode": self._view_mode,
+            "icon_step": self.icons.size_step(),
+            "show_hidden": self._show_hidden,
+            "theme": self._theme,
+            "sort": [self._sort_key, self._sort_reverse],
+            "active": self.isActiveWindow(),
+        }
+
+    def apply_state(self, state):
+        """session_state で作った辞書を当てはめる。一枚目のタブは作成時に開いている前提。"""
+        tabs = [t for t in state.get("tabs", []) if isinstance(t, dict)]
+        fix = session.existing_dir
+        for i, t in enumerate(tabs):
+            path = fix(t.get("path"))
+            if i == 0:
+                self._tabs[0]["path"] = path
+            else:
+                self.new_tab(path, switch=False)
+            self._tabs[i]["history"] = [p for p in t.get("history", []) if isinstance(p, str)]
+            self._tabs[i]["future"] = [p for p in t.get("future", []) if isinstance(p, str)]
+
+        if state.get("theme") in theme.PALETTES and state["theme"] != self._theme:
+            self._theme_actions[state["theme"]].setChecked(True)
+            self._theme = state["theme"]
+            self._apply_theme()
+        if bool(state.get("show_hidden")) != self._show_hidden:
+            self.act_hidden.setChecked(bool(state.get("show_hidden")))
+            self._show_hidden = bool(state.get("show_hidden"))
+        sort = state.get("sort")
+        if isinstance(sort, list) and len(sort) == 2 and sort[0] in ui.SORT_KEYS.values():
+            self._sort_key, self._sort_reverse = sort[0], bool(sort[1])
+            self.model.set_sort(self._sort_key, self._sort_reverse)
+            col = next(c for c, k in ui.SORT_KEYS.items() if k == self._sort_key)
+            order = (Qt.SortOrder.DescendingOrder if self._sort_reverse
+                     else Qt.SortOrder.AscendingOrder)
+            self.list.header().setSortIndicator(col, order)
+        if isinstance(state.get("icon_step"), int):
+            self.icons.set_size_step(state["icon_step"])
+        if state.get("view_mode") in ("list", "icons"):
+            self._set_view_mode(state["view_mode"])
+
+        current = state.get("current", 0)
+        current = current if isinstance(current, int) and 0 <= current < len(self._tabs) else 0
+        self._switching = True
+        self.tabbar.setCurrentIndex(current)
+        self._switching = False
+        self.navigate(self._tabs[current]["path"], record=False)
+
+        geo = state.get("geometry")
+        if isinstance(geo, str):
+            self.restoreGeometry(QByteArray.fromBase64(geo.encode("ascii")))
 
     def _select_tab(self, index):
         if 0 <= index < len(self._tabs):
@@ -1158,11 +1233,88 @@ class MainWindow(QMainWindow):
             act.setEnabled(on)
 
 
+def save_session(path=None):
+    """開いている全部の窓の状態を書く。窓が一枚も無ければ何もしない（空で上書きしない）。"""
+    if not WINDOWS:
+        return
+    try:
+        session.save([w.session_state() for w in WINDOWS], path)
+    except OSError:
+        pass   # 覚えられなくても終了や再起動は止めない
+
+
+def restore_windows(states):
+    """保存された窓を作り直す。一枚も作れなければ False。"""
+    active = None
+    for state in states:
+        if not isinstance(state, dict) or not state.get("tabs"):
+            continue
+        first = session.existing_dir(state["tabs"][0].get("path"))
+        win = open_window(first)
+        win.apply_state(state)
+        if state.get("active"):
+            active = win
+    if active is not None:
+        active.raise_()
+        active.activateWindow()
+    refresh_chaos()
+    return bool(WINDOWS)
+
+
+def restart_self():
+    """状態を受け渡し用のファイルに書き、自分をもう一つ起動してから終わる。"""
+    path = session.temp_path()
+    save_session(path)
+    osops.relaunch(["--restore", path])
+    QApplication.quit()
+
+
+def _busy_reason():
+    """今は終われない理由。終われるなら None。
+
+    名前の変更などのダイアログやメニューを開いている最中に消えると、
+    入力の途中の内容が黙って失われる。そういうときは断る。
+    コピー・移動の最中は OS のダイアログが処理を握っているので、そもそも返事ができない
+    （頼んだ側が時間切れで諦める）。
+    """
+    if QApplication.activeModalWidget() is not None:
+        return "ダイアログを開いています"
+    if QApplication.activePopupWidget() is not None:
+        return "メニューを開いています"
+    return None
+
+
+def _on_quit_request(path):
+    reason = _busy_reason()
+    if reason:
+        return reason
+    save_session(path)
+    return None
+
+
+def _parse_args(argv):
+    """[フォルダ] か --restore [状態ファイル]。フォルダを渡されたときは復元しない。"""
+    args = argv[1:]
+    if args and args[0] == "--restore":
+        return None, (args[1] if len(args) > 1 else None), True
+    return (args[0] if args else None), None, False
+
+
 def main():
-    start = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~")
+    start, restore_from, forced = _parse_args(sys.argv)
     app = QApplication(sys.argv)
     app.setApplicationName("Filer")
-    open_window(start)
+    # トレイの「終了」など、窓を閉じずに終わる経路でも状態を覚える
+    app.aboutToQuit.connect(save_session)
+    control.start(_on_quit_request)
+
+    restored = False
+    if start is None:
+        # 受け渡し用のファイルは読んだら消す。いつもの保存先は残す。
+        states = session.load(restore_from, remove=bool(restore_from))
+        restored = restore_windows(states)
+    if not restored:
+        open_window(start or os.path.expanduser("~"))
     sys.exit(app.exec())
 
 

@@ -13,6 +13,7 @@ from PySide6.QtCore import (
     QMimeData,
     QModelIndex,
     QPoint,
+    QRect,
     QSize,
     QUrl,
     Qt,
@@ -25,6 +26,8 @@ from PySide6.QtWidgets import (
     QFileIconProvider,
     QHeaderView,
     QListView,
+    QStyle,
+    QStyleOptionViewItem,
     QStyledItemDelegate,
     QTabBar,
     QTreeView,
@@ -486,6 +489,55 @@ class NameEditDelegate(QStyledItemDelegate):
             editor.setSelection(0, len(stem))
 
 
+_BREAK_AFTER = " -_.)]"   # ここの直後で折り返せるなら優先する
+
+
+def wrap_name(text, fm, width, max_lines):
+    """名前を width に収まる行に割る。単語の切れ目が無ければ文字の途中でも割る。
+
+    max_lines を超える分は最終行の真ん中を省略する（一覧と同じく拡張子を残すため）。
+    """
+    lines, rest = [], text
+    while rest and len(lines) < max_lines:
+        if fm.horizontalAdvance(rest) <= width:
+            lines.append(rest)
+            rest = ""
+            break
+        if len(lines) == max_lines - 1:
+            lines.append(fm.elidedText(rest, Qt.TextElideMode.ElideMiddle, width))
+            rest = ""
+            break
+        # 入る最長の頭を探し、その中で最後の切れ目があればそこで割る
+        n = 1
+        while n < len(rest) and fm.horizontalAdvance(rest[:n + 1]) <= width:
+            n += 1
+        cut = max((i + 1 for i in range(n) if rest[i] in _BREAK_AFTER), default=0)
+        cut = cut if cut > n // 2 else n
+        lines.append(rest[:cut].rstrip())
+        rest = rest[cut:].lstrip()
+    return lines
+
+
+class IconNameDelegate(NameEditDelegate):
+    """アイコン表示の名前を折り返して描く。省略しない（行数の上限を超えた分だけ省略）。
+
+    描画そのものは Qt に任せ、渡す文字列に改行を入れるだけにする。
+    選択色などはスタイルシートがそのまま効く。
+    """
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        view = self.parent()
+        width = view.gridSize().width() - theme.ICON_TEXT_MARGIN
+        lines = wrap_name(option.text, option.fontMetrics, width, view.text_lines)
+        option.text = "\n".join(lines)
+
+    def sizeHint(self, option, index):
+        view = self.parent()
+        grid = view.gridSize()
+        return QSize(grid.width() - theme.ICON_SPACING * 2, grid.height() - theme.ICON_SPACING * 2)
+
+
 class FileView(QTreeView):
     """列つきの一覧。Explorer の詳細表示に相当する。"""
 
@@ -582,14 +634,17 @@ class IconView(QListView):
         self.setResizeMode(QListView.ResizeMode.Adjust)
         self.setMovement(QListView.Movement.Static)   # 並べ替えられて散らからないように
         self.setUniformItemSizes(True)
-        # 詰めた升目に二行は入らないので一行にする。省略は一覧と同じく真ん中で。
-        self.setWordWrap(False)
+        # 名前は省略せず折り返す。升目の高さは、今のフォルダで一番長い名前に合わせる
+        # （上限 theme.ICON_TEXT_MAX_LINES 行）。改行は IconNameDelegate が入れる。
+        # 折り返しを有効にしておかないと、Qt が一行ぶんの高さしか取らず改行ごと省略する。
+        self.setWordWrap(True)
         self.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.setSpacing(theme.ICON_SPACING)
+        self.text_lines = 1
         self._apply_icon_size()
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.setItemDelegate(NameEditDelegate(self))
+        self.setItemDelegate(IconNameDelegate(self))
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         _setup_dnd(self)
         self.doubleClicked.connect(lambda idx: self._on_activate(idx.row()))
@@ -622,6 +677,17 @@ class IconView(QListView):
             return
         super().wheelEvent(event)
 
+    def size_step(self):
+        return self._size_step
+
+    def set_size_step(self, step):
+        """段を直接指定する（状態の復元用）。範囲外は端に丸める。"""
+        step = max(0, min(len(theme.ICON_SIZES) - 1, step))
+        if step != self._size_step:
+            self._size_step = step
+            self._apply_icon_size()
+            self.icon_size_changed.emit(theme.ICON_SIZES[step])
+
     def step_icon_size(self, step):
         new = max(0, min(len(theme.ICON_SIZES) - 1, self._size_step + step))
         if new == self._size_step:
@@ -630,13 +696,53 @@ class IconView(QListView):
         self._apply_icon_size()
         self.icon_size_changed.emit(theme.ICON_SIZES[new])
 
-    def _apply_icon_size(self):
+    def setModel(self, model):
+        super().setModel(model)
+        for sig in (model.modelReset, model.layoutChanged, model.rowsInserted, model.rowsRemoved):
+            sig.connect(self._apply_icon_size)
+
+    def _apply_icon_size(self, *_):
         size = theme.ICON_SIZES[self._size_step]
         self.setIconSize(QSize(size, size))
         # 升目はアイコンに余白を足したもの。詰め具合は theme.py の ICON_PAD_* で決まる。
-        self.setGridSize(
-            QSize(max(size + theme.ICON_PAD_X, 56), size + theme.ICON_PAD_Y)
-        )
+        # 名前が折り返す分だけ、行の高さを足す。
+        width = max(size + theme.ICON_PAD_X, theme.ICON_CELL_MIN_WIDTH)
+        fm = self.fontMetrics()
+        need = 1
+        model = self.model()
+        if model is not None:
+            text_w = width - theme.ICON_TEXT_MARGIN
+            for row in range(model.rowCount()):
+                name = model.index(row, 0).data(Qt.ItemDataRole.DisplayRole) or ""
+                if fm.horizontalAdvance(name) > text_w:
+                    need = max(need, len(wrap_name(name, fm, text_w, theme.ICON_TEXT_MAX_LINES)))
+                    if need >= theme.ICON_TEXT_MAX_LINES:
+                        break
+        self.text_lines = need
+        height = size + theme.ICON_PAD_Y
+        if need > 1 and model is not None and model.rowCount():
+            # 文字欄の高さを Qt に実測させ、need 行ぶんに足りない分だけ升目を伸ばす。
+            # 足りないと Qt が最後に入る行で残りをまとめて省略してしまう。
+            height += max(0, need * fm.lineSpacing() - self._text_height(width, height))
+        grid = QSize(width, height)
+        if grid != self.gridSize():
+            self.setGridSize(grid)
+        self.viewport().update()
+
+    def _text_height(self, width, height):
+        """升目が width x height のとき、Qt が名前に割り当てる高さ。"""
+        opt = QStyleOptionViewItem()
+        opt.initFrom(self)
+        opt.rect = QRect(0, 0, width - theme.ICON_SPACING * 2, height - theme.ICON_SPACING * 2)
+        opt.decorationSize = self.iconSize()
+        opt.decorationPosition = QStyleOptionViewItem.Position.Top
+        opt.displayAlignment = Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop
+        opt.features = QStyleOptionViewItem.ViewItemFeature.HasDisplay \
+            | QStyleOptionViewItem.ViewItemFeature.HasDecoration \
+            | QStyleOptionViewItem.ViewItemFeature.WrapText
+        opt.text = "x"
+        opt.icon = self.model().index(0, 0).data(Qt.ItemDataRole.DecorationRole) or opt.icon
+        return self.style().subElementRect(QStyle.SubElement.SE_ItemViewItemText, opt, self).height()
 
 
 def _setup_dnd(widget):

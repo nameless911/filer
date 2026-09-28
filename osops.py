@@ -239,6 +239,30 @@ def disk_info(drive: str) -> dict:
     return result
 
 
+# --- 再起動 ------------------------------------------------------------------
+
+def relaunch(args):
+    """自分自身をもう一つ立ち上げる。今の自分の終了は呼び出し側が行う。
+
+    exe（PyInstaller）なら exe を、ソースなら main.py をコンソール無しの Python で起動する。
+    """
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable]
+    else:
+        exe = sys.executable
+        pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        cmd = [pyw if os.path.exists(pyw) else exe,
+               os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")]
+    env = dict(os.environ)
+    # 1 個版の exe は展開先を環境変数で子に引き継ぐ。そのままだと新しい自分が
+    # 古い自分の展開先（終了と同時に消える）を使ってしまうので、引き継がせない。
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    flags = 0
+    if IS_WINDOWS:
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen(cmd + list(args), env=env, creationflags=flags, close_fds=True)
+
+
 # --- 取り外し ----------------------------------------------------------------
 # 「ハードウェアの安全な取り外し」と同じ経路（CM_Request_Device_Eject）を使う。
 # 開いているアプリへの問い合わせ・キャッシュの書き出し・拒否理由の取得は OS がやる。
