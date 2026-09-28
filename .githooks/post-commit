@@ -1,0 +1,10 @@
+#!/bin/sh
+# Rebuild the exe files in the background after every commit.
+# Output goes to build.log; the commit itself returns immediately.
+# Skip with: SKIP_BUILD=1 git commit ...
+[ -n "$SKIP_BUILD" ] && exit 0
+root="$(git rev-parse --show-toplevel)"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \
+  "Start-Process powershell.exe -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command','& ''$root/build.ps1'' *> ''$root/build.log'''" \
+  >/dev/null 2>&1 &
+exit 0

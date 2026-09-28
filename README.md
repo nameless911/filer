@@ -56,6 +56,25 @@ run.bat
 
 `dist\Filer\`（フォルダ版）と `dist\Filer-portable.exe`（1 個版）ができる。
 
+まとめてやるスクリプトもある：
+
+```bash
+powershell -ExecutionPolicy Bypass -File build.ps1                    # ビルドと zip 化
+powershell -ExecutionPolicy Bypass -File build.ps1 -Release v0.2.0    # + タグ付け・push・Releases 公開
+```
+
+### コミットしたら自動でビルドし直す
+
+クローンしたあと一度だけ：
+
+```bash
+git config core.hooksPath .githooks
+```
+
+以後はコミットするたびに裏で `build.ps1` が走り、`dist\` が最新になる（結果は `build.log`）。
+ビルドを飛ばしたいときは `SKIP_BUILD=1 git commit ...`（Git Bash の場合）。
+Releases への公開は自動ではしない。出したいときに `-Release` を付けて実行する。
+
 アイコンを作り直すときは `python appicon.py`（`icon.ico` と `icon_preview.png` を書き出す）。
 
 ---
