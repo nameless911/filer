@@ -239,3 +239,148 @@ def disk_info(drive: str) -> dict:
     return result
 
 
+# --- 取り外し ----------------------------------------------------------------
+# 「ハードウェアの安全な取り外し」と同じ経路（CM_Request_Device_Eject）を使う。
+# 開いているアプリへの問い合わせ・キャッシュの書き出し・拒否理由の取得は OS がやる。
+# ボリュームのロックやマウント解除を自前でやると、拒否されるべき場面で無理に外してしまう。
+
+_IOCTL_STORAGE_GET_DEVICE_NUMBER = 0x002D1080
+_DIGCF_PRESENT, _DIGCF_DEVICEINTERFACE = 0x02, 0x10
+_INVALID_HANDLE = ctypes.c_void_p(-1).value
+
+_VETO_REASONS = {
+    1: "古い形式のデバイスが拒否しました",
+    2: "閉じる処理が終わっていません",
+    3: "アプリが使用中です",
+    4: "サービスが使用中です",
+    5: "ファイルを開いているアプリがあります",
+    6: "デバイスが拒否しました",
+    7: "ドライバーが拒否しました",
+    8: "このデバイスは取り外しに対応していません",
+    9: "電源が足りません",
+    10: "無効にできないデバイスです",
+    11: "古い形式のドライバーが拒否しました",
+    12: "権限が足りません",
+}
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+
+
+class _SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("InterfaceClassGuid", _GUID),
+                ("Flags", wintypes.DWORD), ("Reserved", ctypes.c_size_t)]
+
+
+class _SP_DEVINFO_DATA(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("ClassGuid", _GUID),
+                ("DevInst", wintypes.DWORD), ("Reserved", ctypes.c_size_t)]
+
+
+# GUID_DEVINTERFACE_DISK {53F56307-B6BF-11D0-94F2-00A0C91EFB8B}
+_GUID_DISK = _GUID(0x53F56307, 0xB6BF, 0x11D0,
+                   (ctypes.c_ubyte * 8)(0x94, 0xF2, 0x00, 0xA0, 0xC9, 0x1E, 0xFB, 0x8B))
+
+
+def _k32():
+    """戻り値の型を設定した専用の kernel32。共有の windll.kernel32 は書き換えない。"""
+    k32 = ctypes.WinDLL("kernel32")
+    k32.CreateFileW.restype = wintypes.HANDLE
+    return k32
+
+
+def _device_number(path):
+    """ボリュームやディスクのパスから (種別, ディスク番号) を返す。取れなければ None。"""
+    k32 = _k32()
+    h = k32.CreateFileW(path, 0, 0x1 | 0x2, None, 3, 0, None)
+    if not h or h == _INVALID_HANDLE:
+        return None
+    try:
+        out = (wintypes.DWORD * 3)()
+        ret = wintypes.DWORD()
+        if not k32.DeviceIoControl(wintypes.HANDLE(h), _IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                                   None, 0, out, ctypes.sizeof(out), ctypes.byref(ret), None):
+            return None
+        return out[0], out[1]
+    finally:
+        k32.CloseHandle(wintypes.HANDLE(h))
+
+
+def _disk_devinst(number):
+    """ディスク番号に対応するデバイスノードを探す。"""
+    sa = ctypes.windll.setupapi
+    sa.SetupDiGetClassDevsW.restype = ctypes.c_void_p
+    sa.SetupDiGetClassDevsW.argtypes = [ctypes.POINTER(_GUID), wintypes.LPCWSTR,
+                                        wintypes.HWND, wintypes.DWORD]
+    sa.SetupDiEnumDeviceInterfaces.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                               ctypes.POINTER(_GUID), wintypes.DWORD,
+                                               ctypes.POINTER(_SP_DEVICE_INTERFACE_DATA)]
+    sa.SetupDiGetDeviceInterfaceDetailW.argtypes = [ctypes.c_void_p,
+                                                    ctypes.POINTER(_SP_DEVICE_INTERFACE_DATA),
+                                                    ctypes.c_void_p, wintypes.DWORD,
+                                                    ctypes.POINTER(wintypes.DWORD),
+                                                    ctypes.POINTER(_SP_DEVINFO_DATA)]
+    sa.SetupDiDestroyDeviceInfoList.argtypes = [ctypes.c_void_p]
+
+    hdev = sa.SetupDiGetClassDevsW(ctypes.byref(_GUID_DISK), None, None,
+                                   _DIGCF_PRESENT | _DIGCF_DEVICEINTERFACE)
+    if not hdev or hdev == _INVALID_HANDLE:
+        return None
+    try:
+        i = 0
+        while True:
+            iface = _SP_DEVICE_INTERFACE_DATA(cbSize=ctypes.sizeof(_SP_DEVICE_INTERFACE_DATA))
+            if not sa.SetupDiEnumDeviceInterfaces(hdev, None, ctypes.byref(_GUID_DISK),
+                                                  i, ctypes.byref(iface)):
+                return None
+            i += 1
+            need = wintypes.DWORD()
+            sa.SetupDiGetDeviceInterfaceDetailW(hdev, ctypes.byref(iface), None, 0,
+                                                ctypes.byref(need), None)
+            buf = ctypes.create_string_buffer(need.value)
+            # SP_DEVICE_INTERFACE_DETAIL_DATA_W の cbSize は 64bit で 8、32bit で 6
+            ctypes.c_uint32.from_buffer(buf).value = 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6
+            info = _SP_DEVINFO_DATA(cbSize=ctypes.sizeof(_SP_DEVINFO_DATA))
+            if not sa.SetupDiGetDeviceInterfaceDetailW(hdev, ctypes.byref(iface), buf,
+                                                       need, None, ctypes.byref(info)):
+                continue
+            path = ctypes.wstring_at(ctypes.addressof(buf) + 4)
+            num = _device_number(path)
+            if num and num[1] == number:
+                return info.DevInst
+    finally:
+        sa.SetupDiDestroyDeviceInfoList(hdev)
+
+
+def eject_drive(drive: str):
+    """ドライブを取り外せる状態にする。成功したら None、駄目なら理由を返す。"""
+    if not IS_WINDOWS:
+        return "この環境では未実装です"
+    root = drive.rstrip("\\/")
+    num = _device_number(f"\\\\.\\{root}")
+    if num is None:
+        return "ドライブの情報を取れません"
+    devinst = _disk_devinst(num[1])
+    if devinst is None:
+        return "ドライブに対応するデバイスが見つかりません"
+
+    cfg = ctypes.windll.cfgmgr32
+    # ディスクそのものではなく、その親（USB 大容量記憶装置など）を外す。
+    # 外せない親なら一段ずつ上をたどる。
+    parent = wintypes.DWORD()
+    if cfg.CM_Get_Parent(ctypes.byref(parent), wintypes.DWORD(devinst), 0) != 0:
+        return "親デバイスが見つかりません"
+    veto_type = ctypes.c_int(0)
+    veto_name = ctypes.create_unicode_buffer(260)
+    for _ in range(3):   # 一時的に拒否されることがあるので少しだけ再試行する
+        rc = cfg.CM_Request_Device_EjectW(parent, ctypes.byref(veto_type),
+                                          veto_name, len(veto_name), 0)
+        if rc == 0 and veto_type.value == 0:
+            return None
+    reason = _VETO_REASONS.get(veto_type.value, f"取り外せません (コード {rc})")
+    who = veto_name.value
+    return f"{reason}: {who}" if who else reason
+
+

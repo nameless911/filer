@@ -636,11 +636,45 @@ class MainWindow(QMainWindow):
 
         menu = QMenu(self)
         menu.addAction("新しいタブで開く", lambda: self.new_tab(path))
+        if self._is_ejectable(path, item.data(_DRIVE_INFO)):
+            menu.addAction("取り外す", lambda: self._eject(path))
         menu.addSeparator()
         menu.addAction("プロパティ", lambda: osops.properties(
             path, int(self.winId())
         ))
         menu.exec(self.sidebar.viewport().mapToGlobal(pos))
+
+    @staticmethod
+    def _is_ejectable(path, info):
+        """USB メモリ・SD カード・USB 接続のディスクなら取り外せる。内蔵ディスクは出さない。"""
+        if not path or os.path.splitdrive(path)[1].rstrip("\\/"):
+            return False   # ドライブのルートだけ
+        if _drive_type(path) == 2:
+            return True
+        return bool(info) and info.get("bus") in ("USB", "SD", "MMC", "IEEE1394")
+
+    def _eject(self, path):
+        """取り外す。先に全部の窓でそのドライブを離れて、自分が掴んでいる状態をなくす。"""
+        drive = os.path.splitdrive(path)[0].upper()
+        home = os.path.expanduser("~")
+        for win in WINDOWS:
+            for i, tab in enumerate(win._tabs):
+                if os.path.splitdrive(tab["path"])[0].upper() != drive:
+                    continue
+                if i == win.tabbar.currentIndex():
+                    win.navigate(home)
+                else:
+                    tab["path"] = home
+                    win.tabbar.setTabText(i, win._tab_label(home))
+                    win.tabbar.setTabToolTip(i, home)
+        self.status.setText(f"{drive} を取り外しています…")
+        QApplication.processEvents()
+        err = osops.eject_drive(path)
+        if err:
+            self.status.setText(f"{drive} を取り外せません — {err}")
+        else:
+            self.status.setText(f"{drive} を取り外しました。安全に抜けます")
+            QTimer.singleShot(400, self._fill_sidebar)
 
     # --- テーマ -------------------------------------------------------------
     def _apply_theme(self):

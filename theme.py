@@ -49,6 +49,8 @@ ICON_SPACING = 2
 SIDEBAR_ICON = 16      # アイコンの一辺(px)
 SIDEBAR_ROW_PAD = 1    # 行の上下余白(px)。3 にすると前の間隔に戻る。
 SIDEBAR_HEAD_PAD = 7   # 見出し（場所/ドライブ）の上の余白(px)
+# タブの境目。アクティブなタブの上辺に引く色の帯の太さ(px)。0 にすると帯を消す。
+TAB_ACCENT = 2
 COL_SIZE_WIDTH = 84
 COL_TYPE_WIDTH = 116
 COL_DATE_WIDTH = 126
@@ -77,6 +79,7 @@ PALETTES = {
         "status_top": "#F3F3F3", "status_bottom": "#F3F3F3", "status_text": "#4A4A4A",
         "btn_top": "#FDFDFD", "btn_bottom": "#FDFDFD", "btn_border": "#D6D6D6",
         "btn_hover": "#EAEAEA", "field_bg": "#FFFFFF",
+        "tab_sep": "#C8C8C8", "tab_border": "#D0D0D0", "tab_accent": "#0067C0",
     },
     "win11_dark": {
         "gradient": False,
@@ -96,6 +99,7 @@ PALETTES = {
         "status_top": "#2B2B2B", "status_bottom": "#2B2B2B", "status_text": "#B4B4B4",
         "btn_top": "#323232", "btn_bottom": "#323232", "btn_border": "#3C3C3C",
         "btn_hover": "#3A3A3A", "field_bg": "#1E1E1E",
+        "tab_sep": "#4A4A4A", "tab_border": "#454545", "tab_accent": "#4CC2FF",
     },
     # 自宅用。Windows 11 の上で動かすと爆笑を誘うので既定にはしない。
     "snow": {
@@ -116,6 +120,7 @@ PALETTES = {
         "status_top": "#F0F0F0", "status_bottom": "#DADADA", "status_text": "#4A4A4A",
         "btn_top": "#FDFDFD", "btn_bottom": "#E6E6E6", "btn_border": "#A8A8A8",
         "btn_hover": "#D2D2D2", "field_bg": "#FFFFFF",
+        "tab_sep": "#A8A8A8", "tab_border": "#9A9A9A", "tab_accent": "#2C64C4",
     },
 }
 
@@ -272,19 +277,34 @@ QTabBar#Tabs {{
     background: transparent;
     border: none;
 }}
+/* タブの境目を見せる。
+   非アクティブ同士は右端の 1px の仕切り線で区切る（Chrome と同じ）。
+   アクティブは枠で囲み、上辺に色の帯を引いて、どれが今のタブか一目で分かるようにする。
+   アクティブの左隣の仕切りは枠と二重になるので消す（:next-selected）。 */
 QTabBar#Tabs::tab {{
     background: transparent;
     color: {p['row_dim']};
-    border: none;
-    padding: 5px 10px;
-    margin: 3px 1px 0 1px;
-    border-radius: {r}px;
+    border: 1px solid transparent;
+    border-right: 1px solid {p['tab_sep']};
+    border-top: {TAB_ACCENT}px solid transparent;
+    padding: 4px 10px;
+    margin: 3px 0 0 0;
+    border-radius: 0;
     max-width: 200px;
 }}
-QTabBar#Tabs::tab:hover {{ background: {p['btn_hover']}; }}
+QTabBar#Tabs::tab:next-selected {{ border-right-color: transparent; }}
+QTabBar#Tabs::tab:hover:!selected {{
+    background: {p['btn_hover']};
+    color: {p['row_text']};
+}}
 QTabBar#Tabs::tab:selected {{
     background: {p['row_bg']};
     color: {p['row_text']};
+    border: 1px solid {p['tab_border']};
+    border-top: {TAB_ACCENT}px solid {p['tab_accent']};
+    border-bottom-color: {p['row_bg']};
+    border-top-left-radius: {r}px;
+    border-top-right-radius: {r}px;
 }}
 QTabBar#Tabs::close-button {{ subcontrol-position: right; }}
 
